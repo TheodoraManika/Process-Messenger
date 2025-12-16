@@ -2,179 +2,204 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include "messaging.h"
-#include "shm_init.h"
-#include "dialogue.h"
-#include "message.h"
-#include "sync.h"
+#include "../include/defs.h"
+#include "../include/ipc.h"
 
-static int current_dialogue = -1;
-static pid_t my_pid;
-static int running = 1;
+SharedMemory* shm;
+int my_dialogue_id = -1;
+int dialogue_index = -1;
+int running = 1;
 
-void signal_handler(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) {
-        running = 0;
-        printf("\nReceived termination signal. Exiting...\n");
-    }
-}
+// Thread function για λήψη μηνυμάτων
+void* receiver_thread(void* arg) {
+    long last_read_seq = shm->global_seq_counter; // Ξεκινάμε διαβάζοντας μόνο νέα μηνύματα
 
-void print_menu(void) {
-    printf("\n========== Process Messenger ==========\n");
-    printf("1. Create/Join Dialogue\n");
-    printf("2. Send Message\n");
-    printf("3. Check Messages\n");
-    printf("4. Terminate Dialogue\n");
-    printf("5. Exit\n");
-    printf("======================================\n");
-    printf("Choose an option: ");
-}
-
-int main(void) {
-    int choice;
-    char input[MAX_MESSAGE_SIZE];
-    int dialogue_id;
-    Message msg;
-
-    my_pid = getpid();
-
-    /* Register signal handlers */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    /* Initialize shared memory */
-    if (init_shared_memory() == -1) {
-        fprintf(stderr, "Failed to initialize shared memory\n");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Process %d started\n", my_pid);
-
-    /* Main loop */
     while (running) {
-        print_menu();
-
-        if (fgets(input, sizeof(input), stdin) == NULL) {
+        sem_wait(&shm->mutex);
+        
+        // Έλεγχος αν ο διάλογος είναι ακόμα ενεργός
+        if (!shm->dialogues[dialogue_index].active) {
+            printf("\n[System]: Dialogue ended by peer.\n");
+            running = 0;
+            sem_post(&shm->mutex);
             break;
         }
 
-        choice = atoi(input);
+        for (int i = 0; i < MAX_MESSAGES; i++) {
+            Message* msg = &shm->messages[i];
 
-        switch (choice) {
-            case 1:  /* Create/Join Dialogue */
-                printf("Enter dialogue ID (positive integer): ");
-                if (fgets(input, sizeof(input), stdin) == NULL) break;
-                dialogue_id = atoi(input);
+            // Αν υπάρχει μήνυμα, είναι για τον διάλογό μας, ΔΕΝ το στείλαμε εμείς, και είναι νεότερο
+            if (!msg->is_free && 
+                msg->dialogue_id == my_dialogue_id && 
+                msg->sender_pid != getpid() &&
+                msg->sequence_num > last_read_seq) {
 
-                if (dialogue_id <= 0) {
-                    printf("Invalid dialogue ID\n");
-                    break;
-                }
-
-                if (create_or_join_dialogue(dialogue_id) == -1) {
-                    printf("Failed to create/join dialogue\n");
-                } else {
-                    current_dialogue = dialogue_id;
-                    printf("Dialogue %d is now active\n", dialogue_id);
-                }
-                break;
-
-            case 2:  /* Send Message */
-                if (current_dialogue == -1) {
-                    printf("No active dialogue. Join a dialogue first.\n");
-                    break;
-                }
-
-                printf("Enter message (max %d chars): ", MAX_MESSAGE_SIZE - 1);
-                if (fgets(input, sizeof(input), stdin) == NULL) break;
-
-                /* Remove newline */
-                size_t len = strlen(input);
-                if (len > 0 && input[len - 1] == '\n') {
-                    input[len - 1] = '\0';
-                }
-
-                if (send_message(current_dialogue, my_pid, input) == 0) {
-                    printf("Message sent: %s\n", input);
-                    
-                    /* Check if this is a TERMINATE message */
-                    if (strcmp(input, "TERMINATE") == 0) {
-                        printf("Terminating dialogue...\n");
-                        terminate_dialogue(current_dialogue, my_pid);
-                        current_dialogue = -1;
-                        printf("Dialogue terminated. Exiting...\n");
-                        running = 0;
-                    }
-                } else {
-                    printf("Failed to send message\n");
-                }
-                break;
-
-            case 3:  /* Check Messages */
-                if (current_dialogue == -1) {
-                    printf("No active dialogue.\n");
-                    break;
-                }
-
-                printf("Checking for new messages in dialogue %d...\n", current_dialogue);
-                
-                int found = 0;
-                while (receive_message(current_dialogue, my_pid, &msg) == 1) {
-                    found = 1;
-                    printf("Message from PID %d: %s\n", msg.sender_pid, msg.payload);
-                    
-                    /* Check if this is a TERMINATE message */
-                    if (strcmp(msg.payload, "TERMINATE") == 0) {
-                        printf("Dialogue terminated by another process.\n");
-                        terminate_dialogue(current_dialogue, my_pid);
-                        current_dialogue = -1;
-                        printf("Exiting...\n");
-                        running = 0;
-                        break;
-                    }
-                }
-
-                if (!found) {
-                    printf("No new messages.\n");
-                }
-                break;
-
-            case 4:  /* Terminate Dialogue */
-                if (current_dialogue == -1) {
-                    printf("No active dialogue.\n");
-                    break;
-                }
-
-                printf("Sending TERMINATE message...\n");
-                if (send_message(current_dialogue, my_pid, "TERMINATE") == 0) {
-                    terminate_dialogue(current_dialogue, my_pid);
-                    current_dialogue = -1;
-                    printf("Dialogue terminated. Exiting...\n");
+                // Έλεγχος TERMINATE
+                if (strcmp(msg->payload, "TERMINATE") == 0) {
+                    printf("\n[System]: Received TERMINATE signal. Closing...\n");
                     running = 0;
                 } else {
-                    printf("Failed to send TERMINATE message\n");
+                    printf("\n[Peer %d]: %s\nInput: ", msg->sender_pid, msg->payload);
+                    fflush(stdout);
                 }
-                break;
 
-            case 5:  /* Exit */
-                if (current_dialogue != -1) {
-                    printf("Please terminate the active dialogue first.\n");
-                } else {
-                    running = 0;
+                // Ενημέρωση κατάστασης μηνύματος
+                msg->readers_count++;
+                last_read_seq = msg->sequence_num; // Ενημέρωση τοπικού δείκτη
+
+                // Αν το έχουν διαβάσει όλοι (Participants - 1 Sender), διαγράφεται
+                if (msg->readers_count >= (shm->dialogues[dialogue_index].participants - 1)) {
+                    msg->is_free = 1;
                 }
-                break;
+            }
+        }
+        sem_post(&shm->mutex);
+        usleep(200000); // Μικρή καθυστέρηση για να μην καίει CPU (polling)
+    }
+    return NULL;
+}
 
-            default:
-                printf("Invalid choice. Try again.\n");
+void cleanup_and_exit() {
+    sem_wait(&shm->mutex);
+    
+    // Αποχώρηση από τον διάλογο
+    if (dialogue_index != -1) {
+        shm->dialogues[dialogue_index].participants--;
+        if (shm->dialogues[dialogue_index].participants <= 0) {
+            shm->dialogues[dialogue_index].active = 0;
+            printf("[System]: Dialogue closed (no participants left).\n");
         }
     }
 
-    /* Cleanup */
-    cleanup_shared_memory();
-    printf("Process %d exiting\n", my_pid);
+    shm->active_app_count--;
+    int apps_left = shm->active_app_count;
+    sem_post(&shm->mutex);
 
-    return EXIT_SUCCESS;
+    detach_shm(shm);
+
+    // Αν είμαστε η τελευταία εφαρμογή γενικώς, σβήνουμε τη μνήμη
+    if (apps_left <= 0) {
+        printf("[System]: Last process exiting. Cleaning up Shared Memory.\n");
+        destroy_shm();
+    }
+
+    exit(0);
+}
+
+int main() {
+    shm = connect_to_shm();
+    
+    // Αρχικοποίηση Semaphore αν είναι η πρώτη φορά (Active apps = 0)
+    // Προσοχή: Εδώ γίνεται απλοϊκά. Σε real-world θέλει atomic check.
+    if (shm->active_app_count == 0) {
+        sem_init(&shm->mutex, 1, 1);
+        memset(shm->dialogues, 0, sizeof(shm->dialogues));
+        for(int i=0; i<MAX_MESSAGES; i++) shm->messages[i].is_free = 1;
+        shm->global_seq_counter = 0;
+    }
+
+    sem_wait(&shm->mutex);
+    shm->active_app_count++;
+    sem_post(&shm->mutex);
+
+    printf("--- Messaging System (PID: %d) ---\n", getpid());
+    printf("1. Start new dialogue\n2. Join existing dialogue\nChoice: ");
+    int choice;
+    scanf("%d", &choice);
+
+    sem_wait(&shm->mutex);
+    if (choice == 1) {
+        dialogue_index = find_free_dialogue_slot(shm);
+        if (dialogue_index == -1) {
+            printf("No space for new dialogues.\n");
+            sem_post(&shm->mutex);
+            cleanup_and_exit();
+        }
+        printf("Enter ID for new dialogue: ");
+        scanf("%d", &my_dialogue_id);
+        
+        // Έλεγχος αν υπάρχει ήδη
+        if (find_dialogue_index(shm, my_dialogue_id) != -1) {
+             printf("Dialogue ID already exists!\n");
+             sem_post(&shm->mutex);
+             cleanup_and_exit();
+        }
+
+        shm->dialogues[dialogue_index].id = my_dialogue_id;
+        shm->dialogues[dialogue_index].participants = 1;
+        shm->dialogues[dialogue_index].active = 1;
+        printf("Dialogue %d created.\n", my_dialogue_id);
+
+    } else {
+        printf("Enter Dialogue ID to join: ");
+        scanf("%d", &my_dialogue_id);
+        dialogue_index = find_dialogue_index(shm, my_dialogue_id);
+        if (dialogue_index == -1) {
+            printf("Dialogue not found.\n");
+            sem_post(&shm->mutex);
+            cleanup_and_exit();
+        }
+        shm->dialogues[dialogue_index].participants++;
+        printf("Joined dialogue %d. Total users: %d\n", my_dialogue_id, shm->dialogues[dialogue_index].participants);
+    }
+    sem_post(&shm->mutex);
+
+    // Εκκίνηση Receiver Thread
+    pthread_t r_thread;
+    if (pthread_create(&r_thread, NULL, receiver_thread, NULL) != 0) {
+        perror("Failed to create thread");
+        cleanup_and_exit();
+    }
+
+    // Main Loop - Sending
+    char buffer[MAX_MSG_LEN];
+    // Καθαρισμός buffer εισόδου
+    int c; while ((c = getchar()) != '\n' && c != EOF); 
+
+    while (running) {
+        printf("Input: ");
+        if (fgets(buffer, MAX_MSG_LEN, stdin) == NULL) break;
+        
+        // Αφαίρεση newline
+        buffer[strcspn(buffer, "\n")] = 0;
+
+        if (strlen(buffer) == 0) continue;
+
+        sem_wait(&shm->mutex);
+        
+        // Εύρεση κενής θέσης μηνύματος
+        int msg_slot = -1;
+        for (int i = 0; i < MAX_MESSAGES; i++) {
+            if (shm->messages[i].is_free) {
+                msg_slot = i;
+                break;
+            }
+        }
+
+        if (msg_slot != -1) {
+            shm->global_seq_counter++;
+            shm->messages[msg_slot].is_free = 0;
+            shm->messages[msg_slot].dialogue_id = my_dialogue_id;
+            shm->messages[msg_slot].sender_pid = getpid();
+            strncpy(shm->messages[msg_slot].payload, buffer, MAX_MSG_LEN);
+            shm->messages[msg_slot].readers_count = 0;
+            shm->messages[msg_slot].sequence_num = shm->global_seq_counter;
+            
+            if (strcmp(buffer, "TERMINATE") == 0) {
+                running = 0; // Τερματισμός τοπικά
+            }
+        } else {
+            printf("[System]: Message buffer full. Try again later.\n");
+        }
+
+        sem_post(&shm->mutex);
+        
+        if (!running) break;
+    }
+
+    pthread_join(r_thread, NULL);
+    cleanup_and_exit();
+    return 0;
 }

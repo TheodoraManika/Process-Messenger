@@ -1,54 +1,54 @@
+# Ορισμός του Compiler
 CC = gcc
-CFLAGS = -Wall -Wextra -pedantic -std=c99 -D_POSIX_C_SOURCE=200809L
-LDFLAGS = -lrt
 
-SRC_DIR = src
-INC_DIR = include
+# Flags για τον Compiler (Warnings και Debugging info)
+CFLAGS = -Wall -Wextra -g
+
+# Flags για τον Linker (Βιβλιοθήκες για Real-time και Threads)
+LDFLAGS = -lrt -lpthread
+
+# Το όνομα του τελικού εκτελέσιμου (τοποθετημένο στον φάκελο bin)
 BIN_DIR = bin
+TARGET = $(BIN_DIR)/chat_app
+
+# Διευθύνσεις πηγών και αντικειμένων
+SRCS = src/main.c src/ipc.c
 OBJ_DIR = obj
 
-# Source files
-SRCS = $(SRC_DIR)/main.c \
-       $(SRC_DIR)/shm_init.c \
-       $(SRC_DIR)/dialogue.c \
-       $(SRC_DIR)/message.c \
-       $(SRC_DIR)/sync.c
+# Μετατροπή των .c σε .o μέσα στον κατάλογο $(OBJ_DIR)
+OBJS = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))
 
-OBJS = $(OBJ_DIR)/main.o \
-       $(OBJ_DIR)/shm_init.o \
-       $(OBJ_DIR)/dialogue.o \
-       $(OBJ_DIR)/message.o \
-       $(OBJ_DIR)/sync.o
+# Κεφαλίδες (αν αλλάξουν, πρέπει να ξαναγίνει compile)
+HEADERS = include/defs.h include/ipc.h
 
-TARGET = $(BIN_DIR)/process_messenger
-
-# Default target
+# Ο βασικός κανόνας (default)
 all: $(TARGET)
 
-# Create directories
-$(BIN_DIR):
-	@mkdir -p $(BIN_DIR)
-
+# Δημιουργία φακέλου αντικειμένων
 $(OBJ_DIR):
-	@mkdir -p $(OBJ_DIR)
+	mkdir -p $(OBJ_DIR)
 
-# Compile object files
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -I$(INC_DIR) -c $< -o $@
+# Δημιουργία φακέλου για το εκτελέσιμο
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
 
-# Link executable
+# Κανόνας για τη δημιουργία του εκτελέσιμου (Linking)
 $(TARGET): $(OBJS) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
-	@echo "Build successful: $(TARGET)"
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
 
-# Run the program
+# Κανόνας για τη δημιουργία των object files (.o) μέσα στον $(OBJ_DIR)
+# Το $< είναι το αρχείο εισόδου (.c) και το $@ είναι το αρχείο εξόδου (.o)
+$(OBJ_DIR)/%.o: src/%.c $(HEADERS) | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Κανόνας για καθαρισμό (διαγραφή compiled αρχείων)
+clean:
+	rm -rf $(OBJ_DIR) $(BIN_DIR)
+
+# Κανόνας για γρήγορο τρέξιμο (προαιρετικό)
 run: $(TARGET)
 	./$(TARGET)
 
-# Clean build artifacts
-clean:
-	rm -rf $(OBJ_DIR) $(BIN_DIR)
-	@echo "Cleaned build artifacts"
-
-# Phony targets
-.PHONY: all run clean
+# Κανόνας για έλεγχο μνήμης με Valgrind (προαιρετικό)
+valgrind: $(TARGET)
+	valgrind --leak-check=full --track-origins=yes ./$(TARGET)
