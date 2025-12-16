@@ -4,8 +4,15 @@ CC = gcc
 # Flags για τον Compiler (Warnings και Debugging info)
 CFLAGS = -Wall -Wextra -g
 
-# Flags για τον Linker (Βιβλιοθήκες για Real-time και Threads)
-LDFLAGS = -lrt -lpthread
+# Ανίχνευση Λειτουργικού
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Linux)
+    LDFLAGS = -lrt -lpthread -lncurses
+else
+    # macOS
+    LDFLAGS = -lpthread -lncurses
+endif
 
 # Το όνομα του τελικού εκτελέσιμου (τοποθετημένο στον φάκελο bin)
 BIN_DIR = bin

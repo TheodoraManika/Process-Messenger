@@ -4,172 +4,309 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <semaphore.h>
+#include <ncurses.h> // Η βιβλιοθήκη για το γραφικό περιβάλλον
 #include "../include/defs.h"
 #include "../include/ipc.h"
 
+// --- Global Variables ---
 SharedMemory* shm;
+#ifdef __APPLE__
+    sem_t *mutex;
+#else
+    // Στο Linux δείχνουμε απευθείας στη μνήμη
+#endif
+
 int my_dialogue_id = -1;
 int dialogue_index = -1;
 int running = 1;
 
-// Thread function για λήψη μηνυμάτων
+// Ncurses Windows
+WINDOW *chat_win;
+WINDOW *input_win;
+WINDOW *info_win;
+
+// Mutex για να μην "μπερδεύεται" η οθόνη όταν γράφουν 2 threads ταυτόχρονα
+pthread_mutex_t screen_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// --- Helper: Safe Print ---
+void write_to_chat(const char* username, const char* msg, int color_pair) {
+    pthread_mutex_lock(&screen_mutex);
+    
+    wattron(chat_win, COLOR_PAIR(color_pair) | A_BOLD);
+    wprintw(chat_win, "[%s]: ", username);
+    wattroff(chat_win, COLOR_PAIR(color_pair) | A_BOLD);
+    
+    wprintw(chat_win, "%s\n", msg);
+    wrefresh(chat_win); // Ενημέρωση παραθύρου chat
+    
+    // Επαναφορά κέρσορα στο input window
+    wrefresh(input_win);
+    
+    pthread_mutex_unlock(&screen_mutex);
+}
+
+// --- Receiver Thread ---
 void* receiver_thread(void* arg) {
-    long last_read_seq = shm->global_seq_counter; // Ξεκινάμε διαβάζοντας μόνο νέα μηνύματα
+    (void)arg;
+    long last_read_seq = shm->global_seq_counter;
 
     while (running) {
+        // Lock IPC Mutex
+#ifdef __APPLE__
+        sem_wait(mutex);
+#else
         sem_wait(&shm->mutex);
-        
-        // Έλεγχος αν ο διάλογος είναι ακόμα ενεργός
-        if (!shm->dialogues[dialogue_index].active) {
-            printf("\n[System]: Dialogue ended by peer.\n");
+#endif
+
+        // Έλεγχος αν έκλεισε ο διάλογος
+        if (dialogue_index != -1 && !shm->dialogues[dialogue_index].active) {
+            write_to_chat("SYSTEM", "Dialogue ended by peer. Press ENTER to exit.", 3);
             running = 0;
+#ifdef __APPLE__
+            sem_post(mutex);
+#else
             sem_post(&shm->mutex);
+#endif
             break;
         }
 
         for (int i = 0; i < MAX_MESSAGES; i++) {
             Message* msg = &shm->messages[i];
 
-            // Αν υπάρχει μήνυμα, είναι για τον διάλογό μας, ΔΕΝ το στείλαμε εμείς, και είναι νεότερο
             if (!msg->is_free && 
                 msg->dialogue_id == my_dialogue_id && 
                 msg->sender_pid != getpid() &&
                 msg->sequence_num > last_read_seq) {
 
-                // Έλεγχος TERMINATE
                 if (strcmp(msg->payload, "TERMINATE") == 0) {
-                    printf("\n[System]: Received TERMINATE signal. Closing...\n");
+                    write_to_chat("SYSTEM", "Received TERMINATE. Press ENTER to exit.", 3);
                     running = 0;
                 } else {
-                    printf("\n[Peer %d]: %s\nInput: ", msg->sender_pid, msg->payload);
-                    fflush(stdout);
+                    char sender_name[32];
+                    snprintf(sender_name, 32, "User %d", msg->sender_pid);
+                    // Χρώμα 2 = Cyan (για τους άλλους)
+                    write_to_chat(sender_name, msg->payload, 2);
                 }
 
-                // Ενημέρωση κατάστασης μηνύματος
                 msg->readers_count++;
-                last_read_seq = msg->sequence_num; // Ενημέρωση τοπικού δείκτη
+                last_read_seq = msg->sequence_num;
 
-                // Αν το έχουν διαβάσει όλοι (Participants - 1 Sender), διαγράφεται
                 if (msg->readers_count >= (shm->dialogues[dialogue_index].participants - 1)) {
                     msg->is_free = 1;
                 }
             }
         }
+        
+        // Unlock IPC Mutex
+#ifdef __APPLE__
+        sem_post(mutex);
+#else
         sem_post(&shm->mutex);
-        usleep(200000); // Μικρή καθυστέρηση για να μην καίει CPU (polling)
+#endif
+        usleep(100000); // 100ms delay
     }
     return NULL;
 }
 
+void cleanup_ncurses() {
+    endwin(); // Κλείσιμο γραφικού περιβάλλοντος
+}
+
 void cleanup_and_exit() {
+    // Καθαρισμός shared memory logic
+#ifdef __APPLE__
+    sem_wait(mutex);
+#else
     sem_wait(&shm->mutex);
+#endif
     
-    // Αποχώρηση από τον διάλογο
     if (dialogue_index != -1) {
         shm->dialogues[dialogue_index].participants--;
         if (shm->dialogues[dialogue_index].participants <= 0) {
             shm->dialogues[dialogue_index].active = 0;
-            printf("[System]: Dialogue closed (no participants left).\n");
         }
     }
 
     shm->active_app_count--;
     int apps_left = shm->active_app_count;
-    sem_post(&shm->mutex);
 
+#ifdef __APPLE__
+    sem_post(mutex);
+    sem_close(mutex);
     detach_shm(shm);
-
-    // Αν είμαστε η τελευταία εφαρμογή γενικώς, σβήνουμε τη μνήμη
     if (apps_left <= 0) {
-        printf("[System]: Last process exiting. Cleaning up Shared Memory.\n");
+        sem_unlink(SEM_NAME);
         destroy_shm();
     }
+#else
+    sem_post(&shm->mutex);
+    detach_shm(shm);
+    if (apps_left <= 0) {
+        sem_destroy(&shm->mutex);
+        destroy_shm();
+    }
+#endif
 
+    cleanup_ncurses();
     exit(0);
 }
 
+void init_ui() {
+    initscr();              // Start ncurses
+    cbreak();               // Line buffering disabled
+    // noecho();            // Don't echo while we do getch (θα το χειριστούμε εμείς)
+    start_color();          // Enable colors
+    curs_set(1);            // Show cursor
+
+    // Ορισμός χρωμάτων (Foreground, Background)
+    init_pair(1, COLOR_GREEN, COLOR_BLACK);   // Εμείς
+    init_pair(2, COLOR_CYAN, COLOR_BLACK);    // Άλλοι
+    init_pair(3, COLOR_RED, COLOR_BLACK);     // System/Errors
+    init_pair(4, COLOR_WHITE, COLOR_BLUE);    // Header/Borders
+
+    // Υπολογισμός διαστάσεων
+    int height, width;
+    getmaxyx(stdscr, height, width);
+
+    // 1. Info Window (Top)
+    info_win = newwin(3, width, 0, 0);
+    wbkgd(info_win, COLOR_PAIR(4));
+    box(info_win, 0, 0);
+    mvwprintw(info_win, 1, 2, "Chat App | PID: %d | Dialogue ID: %d", getpid(), my_dialogue_id);
+    wrefresh(info_win);
+
+    // 2. Chat Window (Middle)
+    // Ύψος = Συνολικό - Header(3) - Input(3)
+    chat_win = newwin(height - 6, width, 3, 0);
+    scrollok(chat_win, TRUE); // Επιτρέπει το scrolling
+    wrefresh(chat_win);
+
+    // 3. Input Window (Bottom)
+    input_win = newwin(3, width, height - 3, 0);
+    box(input_win, 0, 0);
+    mvwprintw(input_win, 1, 2, "> ");
+    wrefresh(input_win);
+}
+
 int main() {
+    // --- Setup Shared Memory ---
     shm = connect_to_shm();
     
-    // Αρχικοποίηση Semaphore αν είναι η πρώτη φορά (Active apps = 0)
-    // Προσοχή: Εδώ γίνεται απλοϊκά. Σε real-world θέλει atomic check.
+#ifdef __APPLE__
+    mutex = sem_open(SEM_NAME, O_CREAT, 0644, 1);
+    if (mutex == SEM_FAILED) { perror("sem_open"); exit(1); }
+#else
     if (shm->active_app_count == 0) {
-        sem_init(&shm->mutex, 1, 1);
+        if (sem_init(&shm->mutex, 1, 1) < 0) { perror("sem_init"); exit(1); }
+    }
+#endif
+
+    // --- Active App Count Increment ---
+#ifdef __APPLE__
+    sem_wait(mutex);
+#else
+    sem_wait(&shm->mutex);
+#endif
+
+    if (shm->active_app_count == 0) {
         memset(shm->dialogues, 0, sizeof(shm->dialogues));
         for(int i=0; i<MAX_MESSAGES; i++) shm->messages[i].is_free = 1;
         shm->global_seq_counter = 0;
     }
-
-    sem_wait(&shm->mutex);
     shm->active_app_count++;
-    sem_post(&shm->mutex);
 
+#ifdef __APPLE__
+    sem_post(mutex);
+#else
+    sem_post(&shm->mutex);
+#endif
+
+    // --- Simple Setup (Standard IO before Ncurses) ---
+    // Κάνουμε τα scanf ΠΡΙΝ μπούμε σε Ncurses mode για να μην μπλέξουμε
     printf("--- Messaging System (PID: %d) ---\n", getpid());
     printf("1. Start new dialogue\n2. Join existing dialogue\nChoice: ");
     int choice;
-    scanf("%d", &choice);
+    if (scanf("%d", &choice) != 1) exit(1);
 
+#ifdef __APPLE__
+    sem_wait(mutex);
+#else
     sem_wait(&shm->mutex);
+#endif
+
     if (choice == 1) {
         dialogue_index = find_free_dialogue_slot(shm);
         if (dialogue_index == -1) {
-            printf("No space for new dialogues.\n");
-            sem_post(&shm->mutex);
-            cleanup_and_exit();
+            printf("No space.\n");
+            exit(0); // Πρέπει να καθαρίσουμε, αλλά για συντομία exit
         }
         printf("Enter ID for new dialogue: ");
         scanf("%d", &my_dialogue_id);
         
-        // Έλεγχος αν υπάρχει ήδη
         if (find_dialogue_index(shm, my_dialogue_id) != -1) {
-             printf("Dialogue ID already exists!\n");
-             sem_post(&shm->mutex);
-             cleanup_and_exit();
+             printf("ID exists!\n");
+             exit(0);
         }
 
         shm->dialogues[dialogue_index].id = my_dialogue_id;
         shm->dialogues[dialogue_index].participants = 1;
         shm->dialogues[dialogue_index].active = 1;
-        printf("Dialogue %d created.\n", my_dialogue_id);
 
     } else {
         printf("Enter Dialogue ID to join: ");
         scanf("%d", &my_dialogue_id);
         dialogue_index = find_dialogue_index(shm, my_dialogue_id);
         if (dialogue_index == -1) {
-            printf("Dialogue not found.\n");
-            sem_post(&shm->mutex);
-            cleanup_and_exit();
+            printf("Not found.\n");
+            exit(0);
         }
         shm->dialogues[dialogue_index].participants++;
-        printf("Joined dialogue %d. Total users: %d\n", my_dialogue_id, shm->dialogues[dialogue_index].participants);
     }
+
+#ifdef __APPLE__
+    sem_post(mutex);
+#else
     sem_post(&shm->mutex);
+#endif
 
-    // Εκκίνηση Receiver Thread
+    // --- START NCURSES UI ---
+    init_ui();
+
+    // Start Receiver Thread
     pthread_t r_thread;
-    if (pthread_create(&r_thread, NULL, receiver_thread, NULL) != 0) {
-        perror("Failed to create thread");
-        cleanup_and_exit();
-    }
+    pthread_create(&r_thread, NULL, receiver_thread, NULL);
 
-    // Main Loop - Sending
     char buffer[MAX_MSG_LEN];
-    // Καθαρισμός buffer εισόδου
-    int c; while ((c = getchar()) != '\n' && c != EOF); 
 
     while (running) {
-        printf("Input: ");
-        if (fgets(buffer, MAX_MSG_LEN, stdin) == NULL) break;
-        
-        // Αφαίρεση newline
-        buffer[strcspn(buffer, "\n")] = 0;
+        // Καθαρισμός input box
+        pthread_mutex_lock(&screen_mutex);
+        werase(input_win);
+        box(input_win, 0, 0);
+        mvwprintw(input_win, 1, 2, "> ");
+        wrefresh(input_win);
+        pthread_mutex_unlock(&screen_mutex);
+
+        // Λήψη εισόδου από χρήστη (Blocking)
+        // wgetnstr διαβάζει μέχρι το Enter
+        mvwgetnstr(input_win, 1, 4, buffer, MAX_MSG_LEN - 1);
 
         if (strlen(buffer) == 0) continue;
+        if (!running) break;
 
+        // Εμφάνιση του δικού μας μηνύματος (Χρώμα 1 = Πράσινο)
+        write_to_chat("ME", buffer, 1);
+
+        // Αποστολή στη Shared Memory
+#ifdef __APPLE__
+        sem_wait(mutex);
+#else
         sem_wait(&shm->mutex);
+#endif
         
-        // Εύρεση κενής θέσης μηνύματος
         int msg_slot = -1;
         for (int i = 0; i < MAX_MESSAGES; i++) {
             if (shm->messages[i].is_free) {
@@ -188,15 +325,15 @@ int main() {
             shm->messages[msg_slot].sequence_num = shm->global_seq_counter;
             
             if (strcmp(buffer, "TERMINATE") == 0) {
-                running = 0; // Τερματισμός τοπικά
+                running = 0;
             }
-        } else {
-            printf("[System]: Message buffer full. Try again later.\n");
         }
 
+#ifdef __APPLE__
+        sem_post(mutex);
+#else
         sem_post(&shm->mutex);
-        
-        if (!running) break;
+#endif
     }
 
     pthread_join(r_thread, NULL);
