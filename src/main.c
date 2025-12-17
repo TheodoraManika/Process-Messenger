@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <semaphore.h>
 #include <ncurses.h> // Η βιβλιοθήκη για το γραφικό περιβάλλον
+#include <ctype.h>
 #include "../include/defs.h"
 #include "../include/ipc.h"
 
@@ -21,7 +22,8 @@ SharedMemory* shm;
 
 int my_dialogue_id = -1;
 int dialogue_index = -1;
-int running = 1;
+int running = 1;    /* app-level running flag */
+int in_dialogue = 0; /* dialogue-level running flag (controls UI/receiver loop) */
 
 // Ncurses Windows
 WINDOW *chat_win;
@@ -53,7 +55,7 @@ void* receiver_thread(void* arg) {
     (void)arg;
     long last_read_seq = shm->global_seq_counter;
 
-    while (running) {
+        while (in_dialogue) {
         // Lock IPC Mutex
 #ifdef __APPLE__
         sem_wait(mutex);
@@ -63,8 +65,8 @@ void* receiver_thread(void* arg) {
 
         // Έλεγχος αν έκλεισε ο διάλογος
         if (dialogue_index != -1 && !shm->dialogues[dialogue_index].active) {
-            write_to_chat("SYSTEM", "Dialogue ended by peer. Press ENTER to exit.", 3);
-            running = 0;
+            write_to_chat("SYSTEM", "Dialogue ended by peer.", 3);
+            in_dialogue = 0;
 #ifdef __APPLE__
             sem_post(mutex);
 #else
@@ -82,8 +84,20 @@ void* receiver_thread(void* arg) {
                 msg->sequence_num > last_read_seq) {
 
                 if (strcmp(msg->payload, "TERMINATE") == 0) {
-                    write_to_chat("SYSTEM", "Received TERMINATE. Press ENTER to exit.", 3);
-                    running = 0;
+                    write_to_chat("SYSTEM", "Received TERMINATE.", 3);
+                    /* Mark dialogue inactive and clear related messages */
+                    if (dialogue_index != -1 && shm->dialogues[dialogue_index].id == msg->dialogue_id) {
+                        shm->dialogues[dialogue_index].active = 0;
+                        shm->dialogues[dialogue_index].participants = 0;
+                        shm->dialogues[dialogue_index].id = 0;
+                        /* clear messages belonging to this dialogue */
+                        for (int m = 0; m < MAX_MESSAGES; m++) {
+                            if (shm->messages[m].dialogue_id == msg->dialogue_id) {
+                                shm->messages[m].is_free = 1;
+                            }
+                        }
+                    }
+                    in_dialogue = 0;
                 } else {
                     char sender_name[32];
                     snprintf(sender_name, 32, "User %d", msg->sender_pid);
@@ -123,12 +137,16 @@ void cleanup_and_exit() {
     sem_wait(&shm->mutex);
 #endif
     
-    if (dialogue_index != -1) {
-        shm->dialogues[dialogue_index].participants--;
-        if (shm->dialogues[dialogue_index].participants <= 0) {
-            shm->dialogues[dialogue_index].active = 0;
+        if (dialogue_index != -1) {
+            if (shm->dialogues[dialogue_index].participants > 0) {
+                shm->dialogues[dialogue_index].participants--;
+            }
+            if (shm->dialogues[dialogue_index].participants <= 0) {
+                shm->dialogues[dialogue_index].active = 0;
+                shm->dialogues[dialogue_index].id = 0;
+                shm->dialogues[dialogue_index].participants = 0;
+            }
         }
-    }
 
     shm->active_app_count--;
     int apps_left = shm->active_app_count;
@@ -211,11 +229,31 @@ int main() {
     sem_wait(&shm->mutex);
 #endif
 
+    /* Sanitize dialogue slots: prevent negative participants and clear stale dialogues */
+    for (int i = 0; i < MAX_DIALOGUES; i++) {
+        int did = shm->dialogues[i].id;
+        if (shm->dialogues[i].participants <= 0) {
+            /* If slot had an id but zero/negative participants, free its messages */
+            if (did != 0) {
+                for (int m = 0; m < MAX_MESSAGES; m++) {
+                    if (shm->messages[m].dialogue_id == did) {
+                        shm->messages[m].is_free = 1;
+                    }
+                }
+            }
+            shm->dialogues[i].participants = 0;
+            shm->dialogues[i].active = 0;
+            shm->dialogues[i].id = 0;
+        }
+    }
+
     if (shm->active_app_count == 0) {
+        /* First time init: ensure messages array marked free and seq counter reset */
         memset(shm->dialogues, 0, sizeof(shm->dialogues));
-        for(int i=0; i<MAX_MESSAGES; i++) shm->messages[i].is_free = 1;
+        for (int i = 0; i < MAX_MESSAGES; i++) shm->messages[i].is_free = 1;
         shm->global_seq_counter = 0;
     }
+
     shm->active_app_count++;
 
 #ifdef __APPLE__
@@ -224,64 +262,106 @@ int main() {
     sem_post(&shm->mutex);
 #endif
 
-    // --- Simple Setup (Standard IO before Ncurses) ---
-    // Κάνουμε τα scanf ΠΡΙΝ μπούμε σε Ncurses mode για να μην μπλέξουμε
-    printf("--- Messaging System (PID: %d) ---\n", getpid());
-    printf("1. Start new dialogue\n2. Join existing dialogue\nChoice: ");
+    // --- Application loop: show menu, join/create dialogues, allow multiple dialogues ---
     int choice;
-    if (scanf("%d", &choice) != 1) exit(1);
-
-#ifdef __APPLE__
-    sem_wait(mutex);
-#else
-    sem_wait(&shm->mutex);
-#endif
-
-    if (choice == 1) {
-        dialogue_index = find_free_dialogue_slot(shm);
-        if (dialogue_index == -1) {
-            printf("No space.\n");
-            exit(0); // Πρέπει να καθαρίσουμε, αλλά για συντομία exit
-        }
-        printf("Enter ID for new dialogue: ");
-        scanf("%d", &my_dialogue_id);
-        
-        if (find_dialogue_index(shm, my_dialogue_id) != -1) {
-             printf("ID exists!\n");
-             exit(0);
-        }
-
-        shm->dialogues[dialogue_index].id = my_dialogue_id;
-        shm->dialogues[dialogue_index].participants = 1;
-        shm->dialogues[dialogue_index].active = 1;
-
-    } else {
-        printf("Enter Dialogue ID to join: ");
-        scanf("%d", &my_dialogue_id);
-        dialogue_index = find_dialogue_index(shm, my_dialogue_id);
-        if (dialogue_index == -1) {
-            printf("Not found.\n");
-            exit(0);
-        }
-        shm->dialogues[dialogue_index].participants++;
-    }
-
-#ifdef __APPLE__
-    sem_post(mutex);
-#else
-    sem_post(&shm->mutex);
-#endif
-
-    // --- START NCURSES UI ---
-    init_ui();
-
-    // Start Receiver Thread
-    pthread_t r_thread;
-    pthread_create(&r_thread, NULL, receiver_thread, NULL);
-
-    char buffer[MAX_MSG_LEN];
-
     while (running) {
+        // Show simple menu (standard I/O) before entering ncurses for each dialogue
+        printf("--- Messaging System (PID: %d) ---\n", getpid());
+        printf("1. Start new dialogue\n2. Join existing dialogue\n3. Exit\nChoice: ");
+        if (scanf("%d", &choice) != 1) {
+            // clear invalid input
+            int c; while ((c = getchar()) != '\n' && c != EOF);
+            continue;
+        }
+
+        if (choice == 3) {
+            /* Exit application */
+            break;
+        }
+
+#ifdef __APPLE__
+        sem_wait(mutex);
+#else
+        sem_wait(&shm->mutex);
+#endif
+
+        if (choice == 1) {
+            dialogue_index = find_free_dialogue_slot(shm);
+            if (dialogue_index == -1) {
+                printf("No space.\n");
+#ifdef __APPLE__
+                sem_post(mutex);
+#else
+                sem_post(&shm->mutex);
+#endif
+                continue;
+            }
+            printf("Enter ID for new dialogue: ");
+            if (scanf("%d", &my_dialogue_id) != 1) {
+                int c; while ((c = getchar()) != '\n' && c != EOF);
+#ifdef __APPLE__
+                sem_post(mutex);
+#else
+                sem_post(&shm->mutex);
+#endif
+                continue;
+            }
+
+            if (find_dialogue_index(shm, my_dialogue_id) != -1) {
+                 printf("ID exists!\n");
+#ifdef __APPLE__
+                sem_post(mutex);
+#else
+                sem_post(&shm->mutex);
+#endif
+                 continue;
+            }
+
+            shm->dialogues[dialogue_index].id = my_dialogue_id;
+            shm->dialogues[dialogue_index].participants = 1;
+            shm->dialogues[dialogue_index].active = 1;
+
+        } else {
+            printf("Enter Dialogue ID to join: ");
+            if (scanf("%d", &my_dialogue_id) != 1) {
+                int c; while ((c = getchar()) != '\n' && c != EOF);
+#ifdef __APPLE__
+                sem_post(mutex);
+#else
+                sem_post(&shm->mutex);
+#endif
+                continue;
+            }
+            dialogue_index = find_dialogue_index(shm, my_dialogue_id);
+            if (dialogue_index == -1) {
+                printf("Not found.\n");
+#ifdef __APPLE__
+                sem_post(mutex);
+#else
+                sem_post(&shm->mutex);
+#endif
+                continue;
+            }
+            shm->dialogues[dialogue_index].participants++;
+        }
+
+#ifdef __APPLE__
+        sem_post(mutex);
+#else
+        sem_post(&shm->mutex);
+#endif
+
+        /* Enter dialogue UI */
+        in_dialogue = 1;
+        init_ui();
+
+        /* Start Receiver Thread */
+        pthread_t r_thread;
+        pthread_create(&r_thread, NULL, receiver_thread, NULL);
+
+        char buffer[MAX_MSG_LEN];
+
+        while (in_dialogue) {
         // Καθαρισμός input box
         pthread_mutex_lock(&screen_mutex);
         werase(input_win);
@@ -290,9 +370,53 @@ int main() {
         wrefresh(input_win);
         pthread_mutex_unlock(&screen_mutex);
 
-        // Λήψη εισόδου από χρήστη (Blocking)
-        // wgetnstr διαβάζει μέχρι το Enter
-        mvwgetnstr(input_win, 1, 4, buffer, MAX_MSG_LEN - 1);
+        // Λήψη εισόδου από χρήστη (non-blocking with timeout)
+        // We use wgetch with wtimeout so the input loop can be interrupted
+        // when `in_dialogue` is cleared by the receiver thread (no need to press Enter).
+        wtimeout(input_win, 100); // 100 ms timeout
+        int idx = 0;
+        buffer[0] = '\0';
+        int ch;
+        while (in_dialogue) {
+            pthread_mutex_lock(&screen_mutex);
+            // redraw prompt and current buffer
+            werase(input_win);
+            box(input_win, 0, 0);
+            mvwprintw(input_win, 1, 2, "> %s", buffer);
+            wrefresh(input_win);
+            pthread_mutex_unlock(&screen_mutex);
+
+            ch = wgetch(input_win);
+            if (ch == ERR) {
+                // timeout, check in_dialogue again
+                continue;
+            }
+
+            if (ch == '\n' || ch == '\r') {
+                // Enter pressed — finish input
+                break;
+            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                if (idx > 0) {
+                    idx--;
+                    buffer[idx] = '\0';
+                }
+            } else if (isprint(ch) && idx < MAX_MSG_LEN - 1) {
+                buffer[idx++] = (char)ch;
+                buffer[idx] = '\0';
+            }
+        }
+
+        // If dialogue was ended by receiver thread, skip processing this buffer
+        if (!in_dialogue) {
+            // clear input window one last time
+            pthread_mutex_lock(&screen_mutex);
+            werase(input_win);
+            box(input_win, 0, 0);
+            mvwprintw(input_win, 1, 2, "> ");
+            wrefresh(input_win);
+            pthread_mutex_unlock(&screen_mutex);
+            continue;
+        }
 
         if (strlen(buffer) == 0) continue;
         if (!running) break;
@@ -325,7 +449,18 @@ int main() {
             shm->messages[msg_slot].sequence_num = shm->global_seq_counter;
             
             if (strcmp(buffer, "TERMINATE") == 0) {
-                running = 0;
+                /* End current dialogue only: mark dialogue inactive and clear messages */
+                if (dialogue_index != -1) {
+                    shm->dialogues[dialogue_index].active = 0;
+                    shm->dialogues[dialogue_index].participants = 0;
+                    shm->dialogues[dialogue_index].id = 0;
+                    for (int m = 0; m < MAX_MESSAGES; m++) {
+                        if (shm->messages[m].dialogue_id == my_dialogue_id) {
+                            shm->messages[m].is_free = 1;
+                        }
+                    }
+                }
+                in_dialogue = 0;
             }
         }
 
@@ -336,7 +471,41 @@ int main() {
 #endif
     }
 
-    pthread_join(r_thread, NULL);
-    cleanup_and_exit();
-    return 0;
-}
+        pthread_join(r_thread, NULL);
+        /* Exit ncurses for this dialogue and return to menu */
+        cleanup_ncurses();
+
+        /* Leave dialogue: decrement participants and mark inactive if needed */
+    #ifdef __APPLE__
+        sem_wait(mutex);
+    #else
+        sem_wait(&shm->mutex);
+    #endif
+
+        if (dialogue_index != -1) {
+            if (shm->dialogues[dialogue_index].participants > 0) {
+                shm->dialogues[dialogue_index].participants--;
+            }
+            if (shm->dialogues[dialogue_index].participants <= 0) {
+                shm->dialogues[dialogue_index].active = 0;
+                shm->dialogues[dialogue_index].id = 0;
+                shm->dialogues[dialogue_index].participants = 0;
+            }
+        }
+
+    #ifdef __APPLE__
+        sem_post(mutex);
+    #else
+        sem_post(&shm->mutex);
+    #endif
+
+        /* Reset dialogue state and loop back to menu */
+        dialogue_index = -1;
+        my_dialogue_id = -1;
+        in_dialogue = 0;
+        }
+
+        /* Application exiting: perform full cleanup */
+        cleanup_and_exit();
+        return 0;
+    }

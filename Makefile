@@ -43,6 +43,12 @@ $(BIN_DIR):
 $(TARGET): $(OBJS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
 
+# Small helper to inspect shared memory
+SHM_DUMP = $(BIN_DIR)/shm_dump
+
+$(SHM_DUMP): $(OBJ_DIR)/shm_dump.o $(OBJ_DIR)/ipc.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 # Κανόνας για τη δημιουργία των object files (.o) μέσα στον $(OBJ_DIR)
 # Το $< είναι το αρχείο εισόδου (.c) και το $@ είναι το αρχείο εξόδου (.o)
 $(OBJ_DIR)/%.o: src/%.c $(HEADERS) | $(OBJ_DIR)
