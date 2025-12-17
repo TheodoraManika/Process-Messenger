@@ -6,29 +6,26 @@ CFLAGS = -Wall -Wextra -g
 
 # Ανίχνευση Λειτουργικού
 UNAME_S := $(shell uname -s)
-
 ifeq ($(UNAME_S),Linux)
-    LDFLAGS = -lrt -lpthread -lncurses
+    LDFLAGS := -lrt -lpthread -lncurses
 else
-    # macOS
-    LDFLAGS = -lpthread -lncurses
+    LDFLAGS := -lpthread -lncurses
 endif
 
-# Το όνομα του τελικού εκτελέσιμου (τοποθετημένο στον φάκελο bin)
-BIN_DIR = bin
-TARGET = $(BIN_DIR)/chat_app
+SRC_DIR := src
+MOD_DIR := modules
+OBJ_DIR := obj
+BIN_DIR := bin
+TARGET := $(BIN_DIR)/chat_app
 
-# Διευθύνσεις πηγών και αντικειμένων
-SRCS = src/main.c src/ipc.c
-OBJ_DIR = obj
+# discover sources automatically
+SRCS := $(wildcard $(SRC_DIR)/*.c) $(wildcard $(MOD_DIR)/*.c)
+OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(filter $(SRC_DIR)/%.c,$(SRCS))) \
+        $(patsubst $(MOD_DIR)/%.c,$(OBJ_DIR)/%.o,$(filter $(MOD_DIR)/%.c,$(SRCS)))
 
-# Μετατροπή των .c σε .o μέσα στον κατάλογο $(OBJ_DIR)
-OBJS = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))
 
-# Κεφαλίδες (αν αλλάξουν, πρέπει να ξαναγίνει compile)
-HEADERS = include/defs.h include/ipc.h
+.PHONY: all clean run valgrind clear_ipc shm_dump_run
 
-# Ο βασικός κανόνας (default)
 all: $(TARGET)
 
 # Δημιουργία φακέλου αντικειμένων
@@ -43,22 +40,14 @@ $(BIN_DIR):
 $(TARGET): $(OBJS) | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
 
-# Small helper to inspect shared memory
-SHM_DUMP = $(BIN_DIR)/shm_dump
 
-$(SHM_DUMP): $(OBJ_DIR)/shm_dump.o $(OBJ_DIR)/ipc.o | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-# Κανόνας για τη δημιουργία των object files (.o) μέσα στον $(OBJ_DIR)
-# Το $< είναι το αρχείο εισόδου (.c) και το $@ είναι το αρχείο εξόδου (.o)
-$(OBJ_DIR)/%.o: src/%.c $(HEADERS) | $(OBJ_DIR)
+# compile rules for sources in src/ and modules/
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Κανόνας για καθαρισμό (διαγραφή compiled αρχείων)
-clean:
-	rm -rf $(OBJ_DIR) $(BIN_DIR)
+$(OBJ_DIR)/%.o: $(MOD_DIR)/%.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# Κανόνας για γρήγορο τρέξιμο (προαιρετικό)
 run: $(TARGET)
 	./$(TARGET)
 
