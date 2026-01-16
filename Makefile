@@ -54,3 +54,6 @@ run: $(TARGET)
 # Κανόνας για έλεγχο μνήμης με Valgrind (προαιρετικό)
 valgrind: $(TARGET)
 	valgrind --leak-check=full --track-origins=yes ./$(TARGET)
+
+make clean:
+	rm -rf $(OBJ_DIR)/*.o $(TARGET)

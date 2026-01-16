@@ -4,7 +4,7 @@
 #include <semaphore.h>
 
 #define SHM_NAME "/chat_shm"
-#define SEM_NAME "/chat_sem"  // <--- ΑΥΤΗ Η ΓΡΑΜΜΗ ΕΛΕΙΠΕ
+#define SEM_NAME "/chat_sem"  
 #define MAX_MSG_LEN 256
 #define MAX_MESSAGES 100
 #define MAX_DIALOGUES 10

@@ -30,10 +30,6 @@ SharedMemory* connect_to_shm() {
         perror("mmap failed");
         exit(1);
     }
-
-    // Αρχικοποίηση αν είμαστε οι πρώτοι (απλοϊκός έλεγχος active_app_count)
-    // Σημείωση: Σε production code θα θέλαμε πιο robust initialization lock.
-    // Εδώ υποθέτουμε ότι η μνήμη είναι μηδενισμένη από το ftruncate.
     
     return shm;
 }
